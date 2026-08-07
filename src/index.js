@@ -221,6 +221,48 @@ async function extractChunks(ffmpeg, videoPath, tmpDir, chunkSeconds) {
 }
 
 // ---------------------------------------------------------------------------
+// 网络请求（带自动重试）
+// ---------------------------------------------------------------------------
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// 上游繁忙/临时故障类错误，重试往往就能恢复
+const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+
+function backoffMs(attempt) {
+  // 2s, 4s, 8s, 16s ... 上限 30s，加一点拖抽避免扎堆
+  const base = Math.min(30000, 2000 * Math.pow(2, attempt));
+  return base + Math.floor(Math.random() * 800);
+}
+
+// 带重试的 fetch：网络异常或可重试状态码会自动重试，成功返回 res
+async function fetchWithRetry(url, options, label, maxRetries = 4) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (e) {
+      if (attempt < maxRetries) {
+        const wait = backoffMs(attempt);
+        log(`${label}网络异常（${e.message}），${Math.round(wait / 1000)} 秒后重试 (${attempt + 1}/${maxRetries})...`);
+        await sleep(wait);
+        continue;
+      }
+      throw new Error(`${label}网络连接失败：${e.message}`);
+    }
+    if (res.ok) return res;
+    const body = await res.text().catch(() => '');
+    if (RETRYABLE_STATUS.has(res.status) && attempt < maxRetries) {
+      const wait = backoffMs(attempt);
+      log(`${label}遇到 ${res.status}（上游繁忙/故障），${Math.round(wait / 1000)} 秒后重试 (${attempt + 1}/${maxRetries})...`);
+      await sleep(wait);
+      continue;
+    }
+    throw new Error(`${label}出错 ${res.status}: ${body.slice(0, 400)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Whisper 听写
 // ---------------------------------------------------------------------------
 
@@ -235,15 +277,11 @@ async function transcribeChunk(conf, chunk) {
     form.append('language', conf.sourceLang);
   }
 
-  const res = await fetch(`${conf.baseUrl}/audio/transcriptions`, {
+  const res = await fetchWithRetry(`${conf.baseUrl}/audio/transcriptions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${conf.apiKey}` },
     body: form,
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`听写接口出错 ${res.status}: ${t.slice(0, 400)}`);
-  }
+  }, '听写接口');
   const json = await res.json();
   const segs = Array.isArray(json.segments) ? json.segments : [];
   return segs
@@ -266,7 +304,7 @@ async function translateBatch(conf, texts) {
   const user = `请翻译下面每一行，返回 JSON 对象，格式为 {"lines": ["第1行译文", "第2行译文", ...]}，`
     + `数组长度必须等于 ${texts.length}。\n\n${numbered}`;
 
-  const res = await fetch(`${conf.baseUrl}/chat/completions`, {
+  const res = await fetchWithRetry(`${conf.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${conf.apiKey}`,
@@ -281,11 +319,7 @@ async function translateBatch(conf, texts) {
         { role: 'user', content: user },
       ],
     }),
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`翻译接口出错 ${res.status}: ${t.slice(0, 400)}`);
-  }
+  }, '翻译接口');
   const json = await res.json();
   const content = json.choices?.[0]?.message?.content || '{}';
   let arr = [];
@@ -307,12 +341,23 @@ async function translateBatch(conf, texts) {
 async function translateAll(conf, segments) {
   const BATCH = 40;
   let done = 0;
+  let failedBatches = 0;
   for (let i = 0; i < segments.length; i += BATCH) {
     const slice = segments.slice(i, i + BATCH);
-    const zh = await translateBatch(conf, slice.map((s) => s.text));
-    slice.forEach((s, k) => { s.zh = zh[k] || ''; });
+    try {
+      const zh = await translateBatch(conf, slice.map((s) => s.text));
+      slice.forEach((s, k) => { s.zh = zh[k] || ''; });
+    } catch (e) {
+      // 这一批翻译失败：保留原文，不中断整体流程
+      failedBatches++;
+      slice.forEach((s) => { s.zh = ''; });
+      log(`⚠️ 第 ${Math.floor(i / BATCH) + 1} 批翻译失败，已保留原文：${e.message}`);
+    }
     done += slice.length;
     log(`翻译进度 ${done}/${segments.length}`);
+  }
+  if (failedBatches) {
+    log(`注意：有 ${failedBatches} 批翻译失败，对应字幕只保留了原文，可稍后重跑补翻。`);
   }
 }
 
@@ -353,13 +398,45 @@ async function main() {
     const chunks = await extractChunks(ffmpeg, videoPath, tmpDir, conf.chunkSeconds);
     log(`音频已切成 ${chunks.length} 段，开始听写...`);
 
-    let segments = [];
+    // 第一轮：逐段听写，失败的先记下来跳过，等全部跑完再统一重试
+    const chunkSegs = new Array(chunks.length).fill(null);
+    let failedIdx = [];
     for (let i = 0; i < chunks.length; i++) {
       log(`听写第 ${i + 1}/${chunks.length} 段...`);
-      const segs = await transcribeChunk(conf, chunks[i]);
-      segments = segments.concat(segs);
+      try {
+        chunkSegs[i] = await transcribeChunk(conf, chunks[i]);
+      } catch (e) {
+        failedIdx.push(i);
+        log(`⚠️ 第 ${i + 1}/${chunks.length} 段听写失败，先跳过，稍后统一重试：${e.message}`);
+      }
     }
-    if (!segments.length) throw new Error('没有识别到任何语音内容。');
+
+    // 收尾：其余段都跑完后，再把之前失败的段统一再试一轮（中转站可能已经缓过来了）
+    if (failedIdx.length) {
+      log(`有 ${failedIdx.length} 段之前失败，开始最后一轮集中重试...`);
+      const stillFailed = [];
+      for (const i of failedIdx) {
+        log(`重试第 ${i + 1}/${chunks.length} 段...`);
+        try {
+          chunkSegs[i] = await transcribeChunk(conf, chunks[i]);
+          log(`✅ 第 ${i + 1} 段重试成功。`);
+        } catch (e) {
+          stillFailed.push(i);
+          log(`⚠️ 第 ${i + 1} 段重试仍失败：${e.message}`);
+        }
+      }
+      failedIdx = stillFailed;
+    }
+
+    // 按时间顺序拼接（跟不上重试的段自然留空）
+    let segments = [];
+    for (let i = 0; i < chunks.length; i++) {
+      if (chunkSegs[i]) segments = segments.concat(chunkSegs[i]);
+    }
+    if (failedIdx.length) {
+      log(`注意：最终仍有 ${failedIdx.length}/${chunks.length} 段听写失败被跳过（第 ${failedIdx.map((i) => i + 1).join('、')} 段），字幕会缺这几段。稍后中转站恢复后重跑即可补全。`);
+    }
+    if (!segments.length) throw new Error('没有识别到任何语音内容（所有分段都失败了，多半是中转站上游故障，过一会儿再试）。');
     log(`听写完成，共 ${segments.length} 条字幕，开始翻译...`);
 
     await translateAll(conf, segments);
