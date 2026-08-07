@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const readline = require('readline');
 const { spawn } = require('child_process');
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,27 @@ function pause(code) {
     try { fs.readSync(0, buf, 0, 1, null); } catch (_) {}
   } catch (_) {}
   process.exit(code || 0);
+}
+
+// 去除拖入/粘贴路径带的引号、空白，以及 Windows 复制路径时可能带的不可见字符
+function cleanPath(s) {
+  return (s || '')
+    .replace(/[\uFEFF\u200E\u200F\u202A-\u202E]/g, '')
+    .trim()
+    .replace(/^"(.*)"$/, '$1')
+    .replace(/^'(.*)'$/, '$1')
+    .trim();
+}
+
+// 双击运行（未传参）时，让用户把视频拖进窗口或粘贴路径
+function askVideoPath() {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question('请把视频文件拖到本窗口里（或粘贴完整路径），然后按回车：\n> ', (ans) => {
+      rl.close();
+      resolve(cleanPath(ans));
+    });
+  });
 }
 
 // 定位 ffmpeg：优先 exe 同目录的 ffmpeg.exe，其次 ffmpeg-static，最后 PATH
@@ -306,14 +328,19 @@ async function main() {
   // 先加载配置（首次运行会生成 config.txt 模板并提示填写）
   const conf = loadConfig();
 
-  const videoPath = process.argv[2];
+  let videoPath = cleanPath(process.argv[2]);
   if (!videoPath) {
-    console.log('用法：把视频文件拖到本程序图标上即可。');
-    console.log('（或命令行：本程序.exe "视频路径"）');
+    console.log('用法：把视频文件拖到本程序图标上，即可直接开始。');
+    console.log('或者按下面提示操作：\n');
+    videoPath = await askVideoPath();
+  }
+  if (!videoPath) {
+    console.log('\n没有输入视频路径。');
     pause(0);
   }
   if (!fs.existsSync(videoPath)) {
-    console.log('找不到文件：' + videoPath);
+    console.log('\n找不到文件：' + videoPath);
+    console.log('（路径要是完整路径，拖入文件通常会自动填对）');
     pause(1);
   }
 
