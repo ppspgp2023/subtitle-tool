@@ -303,6 +303,9 @@ async function main() {
   console.log('        视频 -> 中文字幕 生成工具');
   console.log('==============================================\n');
 
+  // 先加载配置（首次运行会生成 config.txt 模板并提示填写）
+  const conf = loadConfig();
+
   const videoPath = process.argv[2];
   if (!videoPath) {
     console.log('用法：把视频文件拖到本程序图标上即可。');
@@ -314,7 +317,6 @@ async function main() {
     pause(1);
   }
 
-  const conf = loadConfig();
   const ffmpeg = resolveFfmpeg();
   log('输入视频：' + videoPath);
   log(`字幕类型：${conf.bilingual ? '原文+中文双语' : '纯中文'}  翻译模型：${conf.translateModel}`);
