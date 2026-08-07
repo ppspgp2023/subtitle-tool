@@ -1,0 +1,17 @@
+{
+  "name": "video-subtitle-tool",
+  "version": "1.0.0",
+  "description": "视频原声 -> Whisper API 听写 -> GPT 翻译 -> 双语/纯中文 .srt 字幕（支持日/英/韩/法/德/西/俄等多语言自动识别）",
+  "private": true,
+  "bin": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "build": "node build.js"
+  },
+  "dependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "postject": "^1.0.0-alpha.6"
+  }
+}

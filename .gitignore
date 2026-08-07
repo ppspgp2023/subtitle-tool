@@ -1,0 +1,7 @@
+node_modules/
+.cache/
+dist/
+sea-config.json
+test.mp4
+*.srt
+config.txt
