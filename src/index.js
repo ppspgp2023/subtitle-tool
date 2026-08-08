@@ -185,7 +185,10 @@ base_url=https://api.openai.com/v1
 # 【可选】字幕类型：bilingual=原文+中文双语，chinese=纯中文
 subtitle=bilingual
 
-# 【可选】视频原语言：日语 ja / 英语 en / 韩语 ko / 法语 fr / 德语 de / 西语 es / 俄语 ru；不确定填 auto 自动识别
+# 【可选】视频原语言代码。不确定就填 auto 自动识别（Whisper 支持约 99 种语言）。
+# 常用：ja 日 / en 英 / ko 韩 / zh 中 / fr 法 / de 德 / es 西 / it 意 / pt 葡 / ru 俄
+#       ar 阿拉伯 / hi 印地 / th 泰 / vi 越南 / id 印尼 / nl 荷 / pl 波兰 / tr 土耳其
+# 填对应代码可提升该语种识别准确率；小语种/口音重时更建议手动指定。
 source_lang=auto
 
 # 【可选】翻译用的模型（便宜够用：gpt-4o-mini）
