@@ -24,6 +24,7 @@
 - [环境要求](#-环境要求)
 - [快速开始（源码运行）](#-快速开始源码运行)
 - [配置说明（config.txt）](#-配置说明configtxt)
+- [用更准的听写模型（whisper-large-v3）](#-用更准的听写模型whisper-large-v3)
 - [打包成 exe（Windows）](#-打包成-exewindows)
 - [打包后如何使用](#-打包后如何使用)
 - [常见问题](#-常见问题)
@@ -150,9 +151,42 @@ npm start -- "视频路径.mp4"
 | `source_lang` | 视频原语言代码（见[支持的语言](#-支持的语言)）；不确定填 `auto` 自动识别 | `auto` |
 | `translate_model` | 翻译模型 | `gpt-4o-mini` |
 | `whisper_model` | 听写模型 | `whisper-1` |
+| `whisper_base_url` | 【可选】听写专用地址（见[用更准的听写模型](#-用更准的听写模型whisper-large-v3)）；不填则沿用 `base_url` | 空 |
+| `whisper_api_key` | 【可选】听写专用密钥；不填则沿用 `api_key` | 空 |
+| `proxy_url` | 【可选】代理地址；用 Groq 等被墙服务时必填（本工具不认系统代理），如 `http://127.0.0.1:10810`。只有听写走代理 | 空 |
 | `chunk_seconds` | 音频切段秒数（默认 600=10 分钟） | `600` |
 
 > ⚠️ **安全提醒**：`config.txt` 已被 `.gitignore` 忽略，不会上传到仓库。请勿把填了真实 Key 的 `config.txt` 提交到任何公开仓库。
+
+## 🎙️ 用更准的听写模型（whisper-large-v3）
+
+默认的 `whisper-1`（=large-v2）听写准确率一般。想要更准、又保留正确时间轴的话，推荐用 **[Groq](https://console.groq.com)** 免费跑 **`whisper-large-v3`**。
+
+❗ **为什么不用 `gpt-4o-transcribe`**：它不支持 `verbose_json`，**不返回时间戳**，无法定位字幕时间（官方明确）。`whisper-large-v3` 是 Whisper 家族，**天然带时间轴**。
+
+**配置方法**（听写走 Groq、翻译仍走你原来的中转站）：
+
+```
+# 翻译保持不变（走你的中转站 gpt 模型）
+base_url=https://你的中转站/v1
+api_key=你的中转站 key
+translate_model=gpt-4o-mini
+
+# 听写单独指向 Groq
+whisper_base_url=https://api.groq.com/openai/v1
+whisper_api_key=你的 Groq key
+whisper_model=whisper-large-v3
+
+# 国内访问 Groq 需走代理（填你科学上网软件的本地 HTTP 端口）
+proxy_url=http://127.0.0.1:10810
+```
+
+- `whisper_base_url` / `whisper_api_key` **不填时行为与以前完全一致**（听写、翻译都走 `base_url`）。
+- 去 [console.groq.com](https://console.groq.com) 免费注册即可拿 key。
+- **Groq 免费额度**：听写 2000 次/天、音频 7200 秒/小时（≈每小时能处理一部 2 小时电影）、单文件 25MB；个人使用足够。
+- 想更快可换 `whisper_model=whisper-large-v3-turbo`。
+
+> ⚠️ **国内访问 Groq 必须配 `proxy_url`**：Groq 在国内被墙，而本工具用的 Node `fetch` **不认系统代理**，即使你开了 v2ray/clash 也不会自动走。所以要在 `proxy_url` 里显式填代理的**本地 HTTP 端口**：v2rayN 一般是 `http://127.0.0.1:10810`（HTTP 端口 = SOCKS 端口 10809 + 1），clash 一般是 `http://127.0.0.1:7890`。只有**听写**走代理，翻译仍直连 `base_url`。不填会报 `403 Forbidden`。
 
 ## 🛠️ 打包成 exe（Windows）
 
@@ -198,6 +232,12 @@ npm run build
 <summary><b>识别语言不准？</b></summary>
 
 把 `source_lang` 从 `auto` 改成明确的语言代码（如日语 `ja`、英语 `en`），可提升听写准确率。
+</details>
+
+<details>
+<summary><b>用 Groq 听写报 403 Forbidden？</b></summary>
+
+Groq 在国内被墙，而本工具不认系统代理（即使开了 v2ray/clash 也不会自动走）。在 `config.txt` 里填上 `proxy_url`，值为你科学上网软件的本地 HTTP 端口（v2rayN 一般 `http://127.0.0.1:10810`，clash 一般 `http://127.0.0.1:7890`），并确保代理软件已开启。详见 [用更准的听写模型](#-用更准的听写模型whisper-large-v3)。
 </details>
 
 <details>

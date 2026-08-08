@@ -13,6 +13,9 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const http = require('http');
+const https = require('https');
+const tls = require('tls');
 const readline = require('readline');
 const { spawn } = require('child_process');
 
@@ -197,6 +200,17 @@ translate_model=gpt-4o-mini
 # 【可选】听写用的模型（whisper-1）
 whisper_model=whisper-1
 
+# 【可选】听写专用地址/密钥：想用更准的 whisper-large-v3 可去 Groq（免费）。
+# 不填就沿用上面的 base_url/api_key；填了则只有“听写”走这里（翻译仍走 base_url）。
+# 用 Groq 时：whisper_base_url=https://api.groq.com/openai/v1，whisper_model=whisper-large-v3
+whisper_base_url=
+whisper_api_key=
+
+# 【可选】代理地址：用 Groq 等被墙服务时必填（本工具不认系统代理，要显式指定）。
+# 填你科学上网软件的本地 HTTP 端口，如 v2rayN 的 http://127.0.0.1:10810、clash 的 http://127.0.0.1:7890。
+# 只有“听写”走代理，翻译仍走 base_url（国内直连）。不用 Groq 就留空。
+proxy_url=
+
 # 【可选】音频切段长度（秒），默认 600=10分钟，避免超过接口 25MB 限制
 chunk_seconds=600
 `;
@@ -228,6 +242,13 @@ function loadConfig() {
     whisperModel: cfg.whisper_model || 'whisper-1',
     chunkSeconds: Math.max(60, parseInt(cfg.chunk_seconds || '600', 10) || 600),
   };
+  // 听写可单独指向另一家服务（如 Groq 的 whisper-large-v3）；不填则沿用主地址/密钥
+  conf.whisperBaseUrl = (cfg.whisper_base_url || cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  conf.whisperApiKey = cfg.whisper_api_key || conf.apiKey;
+  // 代理：Node 不认系统代理，国内访问 Groq 等被墙服务需在此填 v2ray/clash 的本地 HTTP 端口。
+  // 仅“听写”请求走代理（翻译走中转站，国内直连无需代理）。
+  conf.proxyUrl = (cfg.proxy_url || '').trim();
+  conf.whisperAgent = conf.proxyUrl ? makeProxyAgent(conf.proxyUrl) : undefined;
   if (!conf.apiKey) {
     console.log('\n>>> config.txt 里的 api_key 还没填！请填好后重新运行。<<<\n');
     pause(1);
@@ -317,6 +338,92 @@ function backoffMs(attempt) {
   return base + Math.floor(Math.random() * 800);
 }
 
+// 构造走 HTTP 代理（如 v2ray/clash 的本地端口）的 HTTPS Agent。
+// Node 自带 fetch 不认系统代理，国内访问 Groq 等被墙服务需要显式走代理。
+// 原理：先向代理发 CONNECT 打通隧道，再在裸 socket 上做 TLS 握手。
+function makeProxyAgent(proxyUrl) {
+  const p = new URL(proxyUrl);
+  const agent = new https.Agent({ keepAlive: false });
+  agent.createConnection = function (options, cb) {
+    const targetHost = options.host;
+    const targetPort = options.port || 443;
+    const req = http.request({
+      host: p.hostname,
+      port: Number(p.port) || 80,
+      method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
+      headers: { Host: `${targetHost}:${targetPort}` },
+    });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        cb(new Error(`代理 CONNECT 失败（${res.statusCode}），请检查 proxy_url 与代理是否开启`));
+        return;
+      }
+      const tlsSocket = tls.connect({ socket, servername: targetHost }, () => cb(null, tlsSocket));
+      tlsSocket.on('error', cb);
+    });
+    req.on('error', (e) => cb(new Error(`连不上代理 ${p.hostname}:${p.port}：${e.message}`)));
+    req.end();
+  };
+  return agent;
+}
+
+// 裸 HTTPS 请求：可挂自定义 agent（走代理），返回 {status, ok, bodyText}。
+// 之所以不用 fetch，是因为 fetch 无法指定 agent 走代理。
+function rawRequest(urlStr, { method = 'GET', headers = {}, body = null, agent = undefined, timeoutMs = 600000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const req = https.request({
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method,
+      headers,
+      agent,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => {
+        const bodyText = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: res.statusCode, ok: res.statusCode >= 200 && res.statusCode < 300, bodyText });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('请求超时')); });
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+// 带重试的裸请求：网络异常或可重试状态码会自动重试，返回已解析的 JSON。
+async function requestJsonWithRetry(urlStr, options, label, maxRetries = 4) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res;
+    try {
+      res = await rawRequest(urlStr, options);
+    } catch (e) {
+      if (attempt < maxRetries) {
+        const wait = backoffMs(attempt);
+        log(`${label}网络异常（${e.message}），${Math.round(wait / 1000)} 秒后重试 (${attempt + 1}/${maxRetries})...`);
+        await sleep(wait);
+        continue;
+      }
+      throw new Error(`${label}网络连接失败：${e.message}`);
+    }
+    if (res.ok) {
+      try { return JSON.parse(res.bodyText); }
+      catch (_) { throw new Error(`${label}返回的不是合法 JSON：${res.bodyText.slice(0, 400)}`); }
+    }
+    if (RETRYABLE_STATUS.has(res.status) && attempt < maxRetries) {
+      const wait = backoffMs(attempt);
+      log(`${label}遇到 ${res.status}（上游繁忙/故障），${Math.round(wait / 1000)} 秒后重试 (${attempt + 1}/${maxRetries})...`);
+      await sleep(wait);
+      continue;
+    }
+    throw new Error(`${label}出错 ${res.status}: ${res.bodyText.slice(0, 400)}`);
+  }
+}
+
 // 带重试的 fetch：网络异常或可重试状态码会自动重试，成功返回 res
 async function fetchWithRetry(url, options, label, maxRetries = 4) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -350,21 +457,38 @@ async function fetchWithRetry(url, options, label, maxRetries = 4) {
 
 async function transcribeChunk(conf, chunk) {
   const data = fs.readFileSync(chunk.file);
-  const form = new FormData();
-  form.append('file', new Blob([data]), path.basename(chunk.file));
-  form.append('model', conf.whisperModel);
-  form.append('response_format', 'verbose_json');
-  form.append('temperature', '0');
+  // 手动拼 multipart/form-data（不用 fetch/FormData，方便挂代理 agent）
+  const boundary = '----NodeSubtitleBoundary' + Math.random().toString(16).slice(2);
+  const fields = [
+    ['model', conf.whisperModel],
+    ['response_format', 'verbose_json'],
+    ['temperature', '0'],
+  ];
   if (conf.sourceLang && conf.sourceLang.toLowerCase() !== 'auto') {
-    form.append('language', conf.sourceLang);
+    fields.push(['language', conf.sourceLang]);
   }
+  const parts = [];
+  for (const [name, value] of fields) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`, 'utf8'));
+  }
+  parts.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${path.basename(chunk.file)}"\r\n`
+    + 'Content-Type: audio/mpeg\r\n\r\n', 'utf8'));
+  parts.push(data);
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'));
+  const bodyBuf = Buffer.concat(parts);
 
-  const res = await fetchWithRetry(`${conf.baseUrl}/audio/transcriptions`, {
+  const json = await requestJsonWithRetry(`${conf.whisperBaseUrl}/audio/transcriptions`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${conf.apiKey}` },
-    body: form,
+    headers: {
+      Authorization: `Bearer ${conf.whisperApiKey}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': bodyBuf.length,
+    },
+    body: bodyBuf,
+    agent: conf.whisperAgent,
   }, '听写接口');
-  const json = await res.json();
   const segs = Array.isArray(json.segments) ? json.segments : [];
   return segs
     .map((s) => ({
