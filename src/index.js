@@ -297,10 +297,11 @@ async function transcribeChunk(conf, chunk) {
 // GPT 翻译
 // ---------------------------------------------------------------------------
 
-async function translateBatch(conf, texts) {
+// 向模型请求一批翻译，返回译文数组（不保证长度）
+async function requestTranslation(conf, texts) {
   const numbered = texts.map((t, i) => `${i + 1}. ${t}`).join('\n');
   const sys = '你是专业的影视字幕翻译。将用户给出的每一行台词（可能是日语/英语/韩语等任意语言）翻译成自然、口语化的简体中文。'
-    + '严格逐行对应，保持行数与编号一致，不要合并或拆分。只输出 JSON。';
+    + '严格逐行对应，保持行数与编号一致，不要合并或拆分，不要漏掉任何一行。只输出 JSON。';
   const user = `请翻译下面每一行，返回 JSON 对象，格式为 {"lines": ["第1行译文", "第2行译文", ...]}，`
     + `数组长度必须等于 ${texts.length}。\n\n${numbered}`;
 
@@ -322,24 +323,28 @@ async function translateBatch(conf, texts) {
   }, '翻译接口');
   const json = await res.json();
   const content = json.choices?.[0]?.message?.content || '{}';
-  let arr = [];
   try {
     const obj = JSON.parse(content);
-    arr = Array.isArray(obj.lines) ? obj.lines : (Array.isArray(obj) ? obj : []);
+    return Array.isArray(obj.lines) ? obj.lines : (Array.isArray(obj) ? obj : []);
   } catch (_) {
-    arr = [];
+    return [];
   }
-  // 行数不匹配时做一次兜底对齐
-  if (arr.length !== texts.length) {
-    const fixed = new Array(texts.length).fill('');
-    for (let i = 0; i < texts.length; i++) fixed[i] = arr[i] || '';
-    return fixed;
-  }
-  return arr;
+}
+
+// 翻译一批：行数对上直接用；对不上（模型合并/拆分/输出被截断）就拆半重译，
+// 避免“整批填空”和“整批错位”（一句对不上就从那句起后面全串位）
+async function translateBatch(conf, texts) {
+  const arr = await requestTranslation(conf, texts);
+  if (arr.length === texts.length) return arr.map((x) => (x == null ? '' : String(x)));
+  if (texts.length <= 1) return [arr[0] != null ? String(arr[0]) : ''];
+  const mid = Math.ceil(texts.length / 2);
+  const left = await translateBatch(conf, texts.slice(0, mid));
+  const right = await translateBatch(conf, texts.slice(mid));
+  return left.concat(right);
 }
 
 async function translateAll(conf, segments) {
-  const BATCH = 40;
+  const BATCH = 25;
   let done = 0;
   let failedBatches = 0;
   for (let i = 0; i < segments.length; i += BATCH) {
