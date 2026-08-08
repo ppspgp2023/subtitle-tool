@@ -98,23 +98,41 @@ function parseTimeToSec(s) {
   return sec;
 }
 
-// 询问可选的时间段；直接回车=整部。返回 {startSec, durationSec} 或 null(整部)
-async function askTimeRange() {
-  console.log('\n可只做某一段的字幕（省时间、省费用）。格式如 00:30:00-00:45:00 或 30:00-45:00。');
+// 解析单个时间段 "a-b" -> {startSec, durationSec}；无效返回 null
+function parseOneRange(str) {
+  const m = (str || '').split(/\s*[-~到至]\s*/).filter(Boolean);
+  if (m.length !== 2) return null;
+  const a = parseTimeToSec(m[0]);
+  const b = parseTimeToSec(m[1]);
+  if (a == null || b == null || b <= a) return null;
+  return { startSec: a, durationSec: b - a };
+}
+
+// 解析多个时间段（用 ; 或 ； 隔开）-> 按开始时间排序的数组；全部无效返回 null
+function parseRanges(str) {
+  const parts = (str || '').split(/[;；]/).map((s) => s.trim()).filter(Boolean);
+  const ranges = [];
+  for (const p of parts) {
+    const r = parseOneRange(p);
+    if (r) ranges.push(r);
+  }
+  if (!ranges.length) return null;
+  ranges.sort((x, y) => x.startSec - y.startSec);
+  return ranges;
+}
+
+// 询问可选的时间段（支持多段）；直接回车=整部。返回 ranges 数组或 null(整部)
+async function askTimeRanges() {
+  console.log('\n可只做某一段或某几段的字幕（省时间、省费用）。');
+  console.log('单段如 00:30:00-00:45:00；多段用分号隔开，如 00:05:00-00:10:00; 01:10:00-01:20:00。');
   const ans = await ask('直接按回车=整部字幕；或输入时间段：\n> ');
   if (!ans) return null;
-  const m = ans.split(/\s*[-~到至]\s*/).filter(Boolean);
-  if (m.length !== 2) {
+  const ranges = parseRanges(ans);
+  if (!ranges) {
     console.log('时间段格式没看懂，将按【整部】处理。');
     return null;
   }
-  const startSec = parseTimeToSec(m[0]);
-  const endSec = parseTimeToSec(m[1]);
-  if (startSec == null || endSec == null || endSec <= startSec) {
-    console.log('时间段无效（结束要晚于开始），将按【整部】处理。');
-    return null;
-  }
-  return { startSec, durationSec: endSec - startSec };
+  return ranges;
 }
 
 // 把秒数格式化为适合文件名的 HHMMSS
@@ -458,26 +476,29 @@ async function main() {
   const ffmpeg = resolveFfmpeg();
   log('输入视频：' + videoPath);
 
-  // 可选：只做某一时间段
-  const range = process.argv[3]
-    ? (function () {
-        const parts = cleanPath(process.argv[3]).split(/\s*[-~到至]\s*/).filter(Boolean);
-        if (parts.length === 2) {
-          const a = parseTimeToSec(parts[0]);
-          const b = parseTimeToSec(parts[1]);
-          if (a != null && b != null && b > a) return { startSec: a, durationSec: b - a };
-        }
-        return null;
-      })()
-    : await askTimeRange();
-  if (range) {
-    log(`只处理时间段：${secToTag(range.startSec)} ～ ${secToTag(range.startSec + range.durationSec)}（字幕时间轴仍对应整部电影）`);
+  // 可选：只做某一段/某几段
+  const ranges = process.argv[3] ? parseRanges(cleanPath(process.argv[3])) : await askTimeRanges();
+  if (ranges) {
+    const desc = ranges.map((r) => `${secToTag(r.startSec)}~${secToTag(r.startSec + r.durationSec)}`).join('、');
+    log(`只处理时间段：${desc}（共 ${ranges.length} 段，字幕时间轴仍对应整部电影）`);
   }
   log(`字幕类型：${conf.bilingual ? '原文+中文双语' : '纯中文'}  翻译模型：${conf.translateModel}`);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vsub-'));
   try {
-    const chunks = await extractChunks(ffmpeg, videoPath, tmpDir, conf.chunkSeconds, range);
+    // 多段时分别抽取到各自子目录（避免文件名冲突），每段偏移已是绝对时间
+    let chunks;
+    if (ranges) {
+      chunks = [];
+      for (let r = 0; r < ranges.length; r++) {
+        const sub = path.join(tmpDir, 'r' + r);
+        fs.mkdirSync(sub);
+        const c = await extractChunks(ffmpeg, videoPath, sub, conf.chunkSeconds, ranges[r]);
+        chunks = chunks.concat(c);
+      }
+    } else {
+      chunks = await extractChunks(ffmpeg, videoPath, tmpDir, conf.chunkSeconds, null);
+    }
     log(`音频已切成 ${chunks.length} 段，开始听写...`);
 
     // 第一轮：逐段听写，失败的先记下来跳过，等全部跑完再统一重试
@@ -510,11 +531,12 @@ async function main() {
       failedIdx = stillFailed;
     }
 
-    // 按时间顺序拼接（跟不上重试的段自然留空）
+    // 拼接后按开始时间排序（多段可能乱序，统一按电影时间轴排）
     let segments = [];
     for (let i = 0; i < chunks.length; i++) {
       if (chunkSegs[i]) segments = segments.concat(chunkSegs[i]);
     }
+    segments.sort((a, b) => a.start - b.start);
     if (failedIdx.length) {
       log(`注意：最终仍有 ${failedIdx.length}/${chunks.length} 段听写失败被跳过（第 ${failedIdx.map((i) => i + 1).join('、')} 段），字幕会缺这几段。稍后中转站恢复后重跑即可补全。`);
     }
@@ -526,18 +548,26 @@ async function main() {
     const srt = buildSrt(segments, conf.bilingual);
     const dir = path.dirname(videoPath);
     const base = path.basename(videoPath, path.extname(videoPath));
-    // 整部：同名 .srt（播放器自动加载）；只做一段：加时间段后缀，避免覆盖整部版
-    const outName = range
-      ? `${base}.段${secToTag(range.startSec)}-${secToTag(range.startSec + range.durationSec)}.srt`
-      : `${base}.srt`;
+    // 整部：同名 .srt（播放器自动加载）；只做部分时段：加时间段后缀，避免覆盖整部版
+    let outName;
+    if (ranges) {
+      const first = ranges[0];
+      const last = ranges[ranges.length - 1];
+      const tag = ranges.length === 1
+        ? `${secToTag(first.startSec)}-${secToTag(first.startSec + first.durationSec)}`
+        : `${secToTag(first.startSec)}-${secToTag(last.startSec + last.durationSec)}兼${ranges.length}段`;
+      outName = `${base}.段${tag}.srt`;
+    } else {
+      outName = `${base}.srt`;
+    }
     const outPath = path.join(dir, outName);
     fs.writeFileSync(outPath, '\ufeff' + srt, 'utf8');
 
     console.log('\n----------------------------------------------');
     log('✅ 完成！字幕已保存：');
     console.log('    ' + outPath);
-    if (range) {
-      console.log('这是只含那一段的字幕（时间轴已对应整部电影）。');
+    if (ranges) {
+      console.log(`这是只含所选 ${ranges.length} 段的字幕（时间轴已对应整部电影）。`);
       console.log('想让 PotPlayer 自动加载：把它重命名成与视频同名的 .srt 即可。');
     } else {
       console.log('用 PotPlayer 打开视频，字幕会自动加载（同名同目录）。');
@@ -545,8 +575,7 @@ async function main() {
     console.log('----------------------------------------------');
   } finally {
     try {
-      fs.readdirSync(tmpDir).forEach((f) => fs.unlinkSync(path.join(tmpDir, f)));
-      fs.rmdirSync(tmpDir);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch (_) {}
   }
   pause(0);
