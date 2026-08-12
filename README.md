@@ -28,6 +28,7 @@
 - [打包成 exe（Windows）](#-打包成-exewindows)
 - [打包后如何使用](#-打包后如何使用)
 - [网页版部署（VPS）](#-网页版部署vps)
+  - [宝塔面板部署（实测流程）](#宝塔面板部署实测流程)
 - [常见问题](#-常见问题)
 - [项目结构](#-项目结构)
 - [技术栈](#-技术栈)
@@ -289,6 +290,48 @@ pm2 save && pm2 startup
 ```
 
 > ⚠️ 任务状态存在内存，进程重启后「进行中」的任务会丢失（已生成的字幕文件仍在）。个人使用可接受。
+
+### 宝塔面板部署（实测流程）
+
+如果 VPS 装了宝塔面板，不用命令行手敲，按下面流程更直观（以 Oracle 境外 VPS + Cloudflare 域名为例，已实测跑通）。
+
+**1. 准备 Node 环境**
+宝塔 → 软件商店 → 装「PM2 管理器」（自带 Node，选 18/20/22 均可）。若已有其它 Node 项目在跑，**无需重装**，`node -v` 确认 ≥ 18 即可复用。
+
+**2. 拉代码 + 装依赖 + 配 .env**
+```bash
+cd /www/wwwroot
+git clone https://github.com/ppspgp2023/subtitle-tool.git
+cd subtitle-tool
+npm install
+cp .env.example .env      # 然后编辑 .env
+```
+在 `.env` 里填好 `AUTH_USER / AUTH_PASS / SESSION_SECRET / OPENAI_API_KEY`。
+
+> ⚠️ **端口避让**：若 3000 已被其它项目占用（`netstat -tlnp | grep node` 可查），在 `.env` 里把 `PORT` 改成空闲端口，如 `PORT=3100`。
+
+**3. PM2 管理器 → 添加 Node 项目**
+- 项目目录：`/www/wwwroot/subtitle-tool`
+- 启动选项：选 **`serve:node server/server.js`**（切勿选 `start`，那是命令行版入口）
+- Node 版本：选你装的；若已在终端 `npm install` 过，可勾选「不安装 node_module」
+- 项目端口（更多配置里）：填与 `.env` 一致的端口（如 3100）；「放行端口」**不勾**（只走反代更安全）
+- 启动后看日志出现 `视频字幕生成服务已启动` 即成功
+
+**4. 反向代理 + 大文件/SSE 调优**
+若在添加项目时填了「绑定域名」，宝塔会自动建一个反代站点指向该端口。进入该站点 → 配置文件，在 `location / { ... }` 里补上：
+```nginx
+client_max_body_size 0;      # 不限制大文件上传
+proxy_buffering off;         # 关缓冲，SSE 进度才实时
+```
+> 宝塔默认已有一行 `proxy_read_timeout 86400s;`，**不要再重复添加** `proxy_read_timeout`，否则 Nginx 会报 `duplicate directive` 重载失败。
+
+**5. HTTPS（Cloudflare 场景）**
+Cloudflare 代理（橙云）开启时，宝塔申请 Let's Encrypt 会因 CF 拦截验证而失败。最省事的做法：宝塔站点保持 HTTP，到 Cloudflare → SSL/TLS 把加密模式选 **Flexible（灵活）** + 开启 Always Use HTTPS，访客即可全程 HTTPS。（想源站也加密：临时把域名改灰云 → 宝塔申请 Let's Encrypt → 改回橙云 + CF 选 Full。）
+
+> Cloudflare 免费版单请求上限 100MB，但本项目分片上传每片 8MB，可穿透 CF 传几个 G 的大视频；SSE 靠 15 秒心跳 + 客户端自动重连保活。
+
+**6. Oracle 防火墙**
+Oracle 需两层放行：控制台子网「安全列表」+ 系统 iptables，用反代时对外只需放行 80/443（业务端口如 3100 不对外开）。详见上面「5. Oracle 防火墙放行端口」。
 
 ## ❓ 常见问题
 
