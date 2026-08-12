@@ -13,13 +13,16 @@ const fs = require('fs');
 const crypto = require('crypto');
 
 const { runPipeline } = require('../src/index.js');
-const { conf, web } = require('./config');
+const { conf, web, magnet: magnetCfg } = require('./config');
 
 const jobs = new Map();          // jobId -> job
 const jobByFile = new Map();     // fileId -> jobId（最新一次）
 const subscribers = new Map();   // jobId -> Set<res>
 const queue = [];
 let running = false;
+const dlQueue = [];             // 磁力“云端下载”等待队列
+let dlActive = 0;              // 当前并行下载数
+const MAX_DL = Math.max(1, (magnetCfg && magnetCfg.maxConcurrent) || 1);
 
 function newId() {
   return crypto.randomBytes(8).toString('hex');
@@ -77,7 +80,7 @@ function enqueueMagnet(magnet, options = {}) {
     baseName: null,
     options,
     magnet,
-    status: 'downloading',
+    status: 'queued',
     log: [],
     error: null,
     srtPath: null,
@@ -85,8 +88,23 @@ function enqueueMagnet(magnet, options = {}) {
   };
   jobs.set(id, job);
   jobByFile.set(fileId, id);
-  process.nextTick(() => prefetchMagnet(id));
+  dlQueue.push(id);
+  process.nextTick(pumpDownloads);
   return id;
+}
+
+// 按并发上限调度磁力下载：空闲槽（dlActive < MAX_DL）时才启动下一个，其余在 dlQueue 等待。
+function pumpDownloads() {
+  while (dlActive < MAX_DL && dlQueue.length) {
+    const id = dlQueue.shift();
+    const job = jobs.get(id);
+    if (!job) continue;
+    dlActive++;
+    prefetchMagnet(id).finally(() => {
+      dlActive--;
+      process.nextTick(pumpDownloads);
+    });
+  }
 }
 
 // 磁力“云端下载”阶段：并行执行，不占用顺序流水线锁。

@@ -66,6 +66,8 @@ const web = {
 const magnet = {
   provider: opt('MAGNET_PROVIDER', 'torbox'),
   torboxApiKey: opt('TORBOX_API_KEY', ''),
+  // 云端下载并发上限：免费档 1 个下载槽，故默认 1；Pro 档可调大（如 3）。
+  maxConcurrent: Math.max(1, parseInt(opt('MAGNET_MAX_CONCURRENT', '1'), 10) || 1),
   enabled: false,
 };
 magnet.enabled = !!magnet.torboxApiKey && opt('MAGNET_ENABLED', 'true').toLowerCase() !== 'false';
