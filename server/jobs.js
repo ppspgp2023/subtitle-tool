@@ -1,7 +1,10 @@
 'use strict';
 
 /*
- * 任务队列：内存存储，顺序处理（一次一个视频，避免打爆 CPU/API 额度）。
+ * 任务队列：内存存储。
+ *  - 听写/翻译流水线顺序处理（一次一个视频，避免打爆 CPU/API 额度）。
+ *  - 磁力的“云端下载”阶段并行执行（下载发生在 TorBox 云端 + 服务器网络 IO，
+ *    不占 CPU），下载完成后再进入顺序流水线。
  * 进度通过 SSE 实时广播；核心处理复用 src/index.js 的 runPipeline。
  */
 
@@ -53,7 +56,17 @@ function enqueue(fileId, videoPath, baseName, options = {}) {
   return id;
 }
 
-// 创建“磁力导入”任务：预生成 fileId，视频尚未落地，先入队，处理时先下载再走流水线。
+// 统一的进度回调：写入 job.log（限长）并 SSE 广播。
+function makeProgress(id, job) {
+  return (msg) => {
+    job.log.push(msg);
+    if (job.log.length > 2000) job.log.shift();
+    broadcast(id, 'progress', { line: msg });
+  };
+}
+
+// 创建“磁力导入”任务：预生成 fileId，视频尚未落地。
+// 云端下载阶段立即并行启动（不占顺序锁），下载完成后再进入 queue 走流水线。
 function enqueueMagnet(magnet, options = {}) {
   const id = newId();
   const fileId = crypto.randomBytes(8).toString('hex');
@@ -64,7 +77,7 @@ function enqueueMagnet(magnet, options = {}) {
     baseName: null,
     options,
     magnet,
-    status: 'queued',
+    status: 'downloading',
     log: [],
     error: null,
     srtPath: null,
@@ -72,9 +85,36 @@ function enqueueMagnet(magnet, options = {}) {
   };
   jobs.set(id, job);
   jobByFile.set(fileId, id);
-  queue.push(id);
-  process.nextTick(processNext);
+  process.nextTick(() => prefetchMagnet(id));
   return id;
+}
+
+// 磁力“云端下载”阶段：并行执行，不占用顺序流水线锁。
+// 下载完成后再进入 queue，与上传任务共享“一次一个”的听写/翻译流水线。
+async function prefetchMagnet(id) {
+  const job = jobs.get(id);
+  if (!job) return;
+  job.status = 'downloading';
+  broadcast(id, 'status', { status: 'downloading' });
+  const onProgress = makeProgress(id, job);
+  try {
+    const { downloadMagnet } = require('./magnet');
+    const { videoPath, name } = await downloadMagnet(job.magnet, {
+      fileId: job.fileId,
+      onProgress,
+    });
+    job.videoPath = videoPath;
+    job.baseName = name.replace(/\.[^.]+$/, '');
+    job.status = 'queued';
+    broadcast(id, 'status', { status: 'queued' });
+    queue.push(id);
+    process.nextTick(processNext);
+  } catch (e) {
+    job.status = 'error';
+    job.error = e && e.message ? e.message : String(e);
+    onProgress('❌ 处理失败：' + job.error);
+    broadcast(id, 'error', { status: 'error', error: job.error });
+  }
 }
 
 async function processNext() {
@@ -87,24 +127,9 @@ async function processNext() {
   job.status = 'running';
   broadcast(id, 'status', { status: 'running' });
 
-  const onProgress = (msg) => {
-    job.log.push(msg);
-    if (job.log.length > 2000) job.log.shift();
-    broadcast(id, 'progress', { line: msg });
-  };
+  const onProgress = makeProgress(id, job);
 
   try {
-    // 磁力导入任务：先把视频从 TorBox 拉回本地，落地成 uploads/<fileId>__<原名>
-    if (job.magnet && !job.videoPath) {
-      const { downloadMagnet } = require('./magnet');
-      const { videoPath, name } = await downloadMagnet(job.magnet, {
-        fileId: job.fileId,
-        onProgress,
-      });
-      job.videoPath = videoPath;
-      job.baseName = name.replace(/\.[^.]+$/, '');
-    }
-
     // 每个任务基于全局 conf 派生，允许覆盖 双语/原语言
     const jobConf = Object.assign({}, conf);
     if (typeof job.options.bilingual === 'boolean') jobConf.bilingual = job.options.bilingual;

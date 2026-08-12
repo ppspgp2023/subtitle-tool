@@ -29,6 +29,7 @@ function fmtTime(ms) {
 
 const STATUS_TEXT = {
   idle: '未处理',
+  downloading: '云端下载中',
   queued: '排队中',
   running: '处理中',
   done: '已完成',
@@ -227,7 +228,7 @@ function actionsTd(f) {
     dl.className = 'link';
     cell.appendChild(dl);
   }
-  if ((f.status === 'running' || f.status === 'queued') && f.jobId) {
+  if ((f.status === 'running' || f.status === 'queued' || f.status === 'downloading') && f.jobId) {
     const view = document.createElement('button');
     view.textContent = '查看进度';
     view.className = 'link';

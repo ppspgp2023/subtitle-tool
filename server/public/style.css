@@ -130,6 +130,7 @@ button.ghost:hover { color: var(--text); background: rgba(255,255,255,0.05); }
   color: var(--text);
 }
 .badge-queued { background: #475569; }
+.badge-downloading { background: #a16207; color: #fef9c3; }
 .badge-running { background: #0369a1; color: #e0f2fe; }
 .badge-done { background: #15803d; color: #dcfce7; }
 .badge-error { background: #b91c1c; color: #fee2e2; }
