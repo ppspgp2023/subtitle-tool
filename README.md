@@ -27,6 +27,7 @@
 - [用更准的听写模型（whisper-large-v3）](#-用更准的听写模型whisper-large-v3)
 - [打包成 exe（Windows）](#-打包成-exewindows)
 - [打包后如何使用](#-打包后如何使用)
+- [网页版部署（VPS）](#-网页版部署vps)
 - [常见问题](#-常见问题)
 - [项目结构](#-项目结构)
 - [技术栈](#-技术栈)
@@ -214,6 +215,81 @@ npm run build
 3. 完成后在**视频所在文件夹**生成同名 `.srt`。
 4. 用 PotPlayer 打开视频，同名同目录字幕会自动加载。
 
+## 🌐 网页版部署（VPS）
+
+除了本地 exe，本项目还内置一套 **网页版服务**：部署到 VPS（推荐境外，直连 OpenAI/Groq 无需代理）后，用浏览器打开网址即可上传视频、实时看进度、下载字幕。适合多台设备共用、或给不方便装软件的人使用。
+
+**特性**：单一共享账号登录 · 大文件分片上传（断点续传，支持几个 G 的视频）· SSE 实时进度 · 到期自动清理（默认 7 天）· 顺序队列（一次处理一个，避免打爆 CPU/额度）。
+
+### 1. 安装依赖
+
+```bash
+git clone https://github.com/ppspgp2023/subtitle-tool.git
+cd subtitle-tool
+npm install
+```
+
+> Linux 上的 ffmpeg 由依赖 `ffmpeg-static` 自动提供，无需单独安装。
+
+### 2. 配置 .env
+
+```bash
+cp .env.example .env
+# 用编辑器改好：AUTH_USER / AUTH_PASS / SESSION_SECRET / OPENAI_API_KEY 等
+```
+
+各项含义见 [.env.example](.env.example) 中的中文注释。**至少要填** `AUTH_USER`、`AUTH_PASS`、`SESSION_SECRET`、`OPENAI_API_KEY`。境外 VPS 直连时 `PROXY_URL` 留空即可。
+
+### 3. 启动
+
+```bash
+npm run serve
+# 启动后访问 http://<服务器IP>:3000
+```
+
+上传的视频、生成的字幕、临时文件都存在 `DATA_DIR`（默认项目下 `data/`），超过 `RETENTION_DAYS` 天自动删除。
+
+### 4. 配 HTTPS 反代（强烈建议）
+
+公网明文传输密码不安全，**务必**在前面加一层带 HTTPS 的反向代理。以 Caddy 为例（自动申请证书），`Caddyfile`：
+
+```
+sub.example.com {
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+Nginx 也可（记得放大 `client_max_body_size` 以支持大文件，并关闭对 `/api/jobs/*/events` 的缓冲以保证 SSE 实时）：
+
+```nginx
+server {
+    server_name sub.example.com;
+    client_max_body_size 0;            # 不限制上传体积
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_buffering off;           # SSE 实时进度
+    }
+}
+```
+
+### 5. Oracle 防火墙放行端口
+
+Oracle Cloud 需两处放行：**① 控制台**该实例所在子网的「安全列表」加一条入站规则（放行 443/80，或直连时放行 `PORT`）；**② 系统防火墙**（Oracle 镜像默认开 iptables），如 `sudo iptables -I INPUT -p tcp --dport 3000 -j ACCEPT` 并持久化。用反代时对外只需放行 80/443。
+
+### 6. 常驻运行（可选）
+
+用 pm2 或 systemd 让服务开机自启、崩溃重拉：
+
+```bash
+npm i -g pm2
+pm2 start server/server.js --name subtitle
+pm2 save && pm2 startup
+```
+
+> ⚠️ 任务状态存在内存，进程重启后「进行中」的任务会丢失（已生成的字幕文件仍在）。个人使用可接受。
+
 ## ❓ 常见问题
 
 <details>
@@ -268,11 +344,19 @@ Groq 在国内被墙，而本工具不认系统代理（即使开了 v2ray/clash
 
 ```
 subtitle-tool/
-├── src/index.js          # 主程序：抽音频 → 听写 → 翻译 → 生成 srt
+├── src/index.js          # 主程序（CLI 与网页版共用）：抽音频 → 听写 → 翻译 → 生成 srt
+├── server/               # 网页版服务（不进 exe）
+│   ├── server.js         # Express 入口：登录 / 上传 / 任务 / SSE / 下载
+│   ├── config.js         # 读取校验 .env
+│   ├── auth.js           # HMAC 签名 Cookie 登录
+│   ├── jobs.js           # 内存任务队列 + SSE 广播
+│   ├── cleanup.js        # 到期文件自动清理
+│   └── public/           # 前端页面（登录页 / 主页 / app.js / 样式）
 ├── build.js              # 打包脚本（Node SEA + postject 注入）
 ├── scripts/
 │   └── fetch-ffmpeg.js   # 拉取 ffmpeg 二进制
 ├── sea-config.json       # SEA 配置（build 时自动生成，已被忽略）
+├── .env.example          # 网页版环境变量示例
 ├── package.json
 └── README.md
 ```

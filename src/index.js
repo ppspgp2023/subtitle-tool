@@ -39,9 +39,16 @@ function appDir() {
   return path.join(__dirname, '..');
 }
 
+// 进度接收器：CLI 下为空（只打印）；Web 服务运行任务时临时挂上，把每行进度转发出去。
+// 任务串行执行，全局单个 sink 不会并发串扰。
+let progressSink = null;
+
 function log(msg) {
   const t = new Date().toTimeString().slice(0, 8);
   console.log(`[${t}] ${msg}`);
+  if (progressSink) {
+    try { progressSink(msg); } catch (_) {}
+  }
 }
 
 // 出错或结束时暂停，避免双击/拖拽运行时窗口一闪而过
@@ -215,6 +222,30 @@ proxy_url=
 chunk_seconds=600
 `;
 
+// 从普通键值对象（config.txt 解析结果，或 Web 服务传入的 env 值）构造 conf。
+// 接受下划线风格的键：api_key/base_url/subtitle/source_lang/translate_model/
+// whisper_model/whisper_base_url/whisper_api_key/proxy_url/chunk_seconds。
+function buildConfFromObject(cfg) {
+  cfg = cfg || {};
+  const conf = {
+    apiKey: cfg.api_key || '',
+    baseUrl: (cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+    bilingual: (cfg.subtitle || 'bilingual').toLowerCase() !== 'chinese',
+    sourceLang: (cfg.source_lang || 'auto').trim(),
+    translateModel: cfg.translate_model || 'gpt-4o-mini',
+    whisperModel: cfg.whisper_model || 'whisper-1',
+    chunkSeconds: Math.max(60, parseInt(cfg.chunk_seconds || '600', 10) || 600),
+  };
+  // 听写可单独指向另一家服务（如 Groq 的 whisper-large-v3）；不填则沿用主地址/密钥
+  conf.whisperBaseUrl = (cfg.whisper_base_url || cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  conf.whisperApiKey = cfg.whisper_api_key || conf.apiKey;
+  // 代理：Node 不认系统代理，国内访问 Groq 等被墙服务需在此填 v2ray/clash 的本地 HTTP 端口。
+  // 仅“听写”请求走代理（翻译走中转站，国内直连无需代理）。
+  conf.proxyUrl = (cfg.proxy_url || '').trim();
+  conf.whisperAgent = conf.proxyUrl ? makeProxyAgent(conf.proxyUrl) : undefined;
+  return conf;
+}
+
 function loadConfig() {
   const cfgPath = path.join(appDir(), 'config.txt');
   if (!fs.existsSync(cfgPath)) {
@@ -233,22 +264,7 @@ function loadConfig() {
     cfg[s.slice(0, idx).trim()] = s.slice(idx + 1).trim();
   });
 
-  const conf = {
-    apiKey: cfg.api_key || '',
-    baseUrl: (cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, ''),
-    bilingual: (cfg.subtitle || 'bilingual').toLowerCase() !== 'chinese',
-    sourceLang: (cfg.source_lang || 'auto').trim(),
-    translateModel: cfg.translate_model || 'gpt-4o-mini',
-    whisperModel: cfg.whisper_model || 'whisper-1',
-    chunkSeconds: Math.max(60, parseInt(cfg.chunk_seconds || '600', 10) || 600),
-  };
-  // 听写可单独指向另一家服务（如 Groq 的 whisper-large-v3）；不填则沿用主地址/密钥
-  conf.whisperBaseUrl = (cfg.whisper_base_url || cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, '');
-  conf.whisperApiKey = cfg.whisper_api_key || conf.apiKey;
-  // 代理：Node 不认系统代理，国内访问 Groq 等被墙服务需在此填 v2ray/clash 的本地 HTTP 端口。
-  // 仅“听写”请求走代理（翻译走中转站，国内直连无需代理）。
-  conf.proxyUrl = (cfg.proxy_url || '').trim();
-  conf.whisperAgent = conf.proxyUrl ? makeProxyAgent(conf.proxyUrl) : undefined;
+  const conf = buildConfFromObject(cfg);
   if (!conf.apiKey) {
     console.log('\n>>> config.txt 里的 api_key 还没填！请填好后重新运行。<<<\n');
     pause(1);
@@ -573,44 +589,16 @@ async function translateAll(conf, segments) {
 }
 
 // ---------------------------------------------------------------------------
-// 主流程
+// 核心流水线（CLI 与 Web 服务共用）
 // ---------------------------------------------------------------------------
 
-async function main() {
-  console.log('==============================================');
-  console.log('        视频 -> 中文字幕 生成工具');
-  console.log('==============================================\n');
-
-  // 先加载配置（首次运行会生成 config.txt 模板并提示填写）
-  const conf = loadConfig();
-
-  let videoPath = cleanPath(process.argv[2]);
-  if (!videoPath) {
-    console.log('用法：把视频文件拖到本程序图标上，即可直接开始。');
-    console.log('或者按下面提示操作：\n');
-    videoPath = await askVideoPath();
-  }
-  if (!videoPath) {
-    console.log('\n没有输入视频路径。');
-    pause(0);
-  }
-  if (!fs.existsSync(videoPath)) {
-    console.log('\n找不到文件：' + videoPath);
-    console.log('（路径要是完整路径，拖入文件通常会自动填对）');
-    pause(1);
-  }
-
-  const ffmpeg = resolveFfmpeg();
-  log('输入视频：' + videoPath);
-
-  // 可选：只做某一段/某几段
-  const ranges = process.argv[3] ? parseRanges(cleanPath(process.argv[3])) : await askTimeRanges();
-  if (ranges) {
-    const desc = ranges.map((r) => `${secToTag(r.startSec)}~${secToTag(r.startSec + r.durationSec)}`).join('、');
-    log(`只处理时间段：${desc}（共 ${ranges.length} 段，字幕时间轴仍对应整部电影）`);
-  }
-  log(`字幕类型：${conf.bilingual ? '原文+中文双语' : '纯中文'}  翻译模型：${conf.translateModel}`);
-
+// 抽音频 → 逐段听写（含收尾重试）→ 翻译 → 拼 SRT。
+// 不写文件、不 pause；返回 { srt, segments, failedIdx, chunkCount }。
+// opts: { ranges, ffmpeg, onProgress }。onProgress 传入时临时接管进度输出。
+async function runPipeline(conf, videoPath, opts = {}) {
+  const { ranges = null, ffmpeg = resolveFfmpeg(), onProgress = null } = opts;
+  const prevSink = progressSink;
+  if (onProgress) progressSink = onProgress;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vsub-'));
   try {
     // 多段时分别抽取到各自子目录（避免文件名冲突），每段偏移已是绝对时间
@@ -673,42 +661,91 @@ async function main() {
     await translateAll(conf, segments);
 
     const srt = buildSrt(segments, conf.bilingual);
-    const dir = path.dirname(videoPath);
-    const base = path.basename(videoPath, path.extname(videoPath));
-    // 整部：同名 .srt（播放器自动加载）；只做部分时段：加时间段后缀，避免覆盖整部版
-    let outName;
-    if (ranges) {
-      const first = ranges[0];
-      const last = ranges[ranges.length - 1];
-      const tag = ranges.length === 1
-        ? `${secToTag(first.startSec)}-${secToTag(first.startSec + first.durationSec)}`
-        : `${secToTag(first.startSec)}-${secToTag(last.startSec + last.durationSec)}兼${ranges.length}段`;
-      outName = `${base}.段${tag}.srt`;
-    } else {
-      outName = `${base}.srt`;
-    }
-    const outPath = path.join(dir, outName);
-    fs.writeFileSync(outPath, '\ufeff' + srt, 'utf8');
-
-    console.log('\n----------------------------------------------');
-    log('✅ 完成！字幕已保存：');
-    console.log('    ' + outPath);
-    if (ranges) {
-      console.log(`这是只含所选 ${ranges.length} 段的字幕（时间轴已对应整部电影）。`);
-      console.log('想让 PotPlayer 自动加载：把它重命名成与视频同名的 .srt 即可。');
-    } else {
-      console.log('用 PotPlayer 打开视频，字幕会自动加载（同名同目录）。');
-    }
-    console.log('----------------------------------------------');
+    return { srt, segments, failedIdx, chunkCount: chunks.length };
   } finally {
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch (_) {}
+    if (onProgress) progressSink = prevSink;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 主流程（CLI 入口）
+// ---------------------------------------------------------------------------
+
+async function main() {
+  console.log('==============================================');
+  console.log('        视频 -> 中文字幕 生成工具');
+  console.log('==============================================\n');
+
+  // 先加载配置（首次运行会生成 config.txt 模板并提示填写）
+  const conf = loadConfig();
+
+  let videoPath = cleanPath(process.argv[2]);
+  if (!videoPath) {
+    console.log('用法：把视频文件拖到本程序图标上，即可直接开始。');
+    console.log('或者按下面提示操作：\n');
+    videoPath = await askVideoPath();
+  }
+  if (!videoPath) {
+    console.log('\n没有输入视频路径。');
+    pause(0);
+  }
+  if (!fs.existsSync(videoPath)) {
+    console.log('\n找不到文件：' + videoPath);
+    console.log('（路径要是完整路径，拖入文件通常会自动填对）');
+    pause(1);
+  }
+
+  const ffmpeg = resolveFfmpeg();
+  log('输入视频：' + videoPath);
+
+  // 可选：只做某一段/某几段
+  const ranges = process.argv[3] ? parseRanges(cleanPath(process.argv[3])) : await askTimeRanges();
+  if (ranges) {
+    const desc = ranges.map((r) => `${secToTag(r.startSec)}~${secToTag(r.startSec + r.durationSec)}`).join('、');
+    log(`只处理时间段：${desc}（共 ${ranges.length} 段，字幕时间轴仍对应整部电影）`);
+  }
+  log(`字幕类型：${conf.bilingual ? '原文+中文双语' : '纯中文'}  翻译模型：${conf.translateModel}`);
+
+  const { srt } = await runPipeline(conf, videoPath, { ranges, ffmpeg });
+
+  const dir = path.dirname(videoPath);
+  const base = path.basename(videoPath, path.extname(videoPath));
+  // 整部：同名 .srt（播放器自动加载）；只做部分时段：加时间段后缀，避免覆盖整部版
+  let outName;
+  if (ranges) {
+    const first = ranges[0];
+    const last = ranges[ranges.length - 1];
+    const tag = ranges.length === 1
+      ? `${secToTag(first.startSec)}-${secToTag(first.startSec + first.durationSec)}`
+      : `${secToTag(first.startSec)}-${secToTag(last.startSec + last.durationSec)}兼${ranges.length}段`;
+    outName = `${base}.段${tag}.srt`;
+  } else {
+    outName = `${base}.srt`;
+  }
+  const outPath = path.join(dir, outName);
+  fs.writeFileSync(outPath, '\ufeff' + srt, 'utf8');
+
+  console.log('\n----------------------------------------------');
+  log('✅ 完成！字幕已保存：');
+  console.log('    ' + outPath);
+  if (ranges) {
+    console.log(`这是只含所选 ${ranges.length} 段的字幕（时间轴已对应整部电影）。`);
+    console.log('想让 PotPlayer 自动加载：把它重命名成与视频同名的 .srt 即可。');
+  } else {
+    console.log('用 PotPlayer 打开视频，字幕会自动加载（同名同目录）。');
+  }
+  console.log('----------------------------------------------');
   pause(0);
 }
 
-main().catch((err) => {
-  console.error('\n❌ 出错了：' + (err && err.message ? err.message : err));
-  pause(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('\n❌ 出错了：' + (err && err.message ? err.message : err));
+    pause(1);
+  });
+}
+
+module.exports = { runPipeline, buildConfFromObject, resolveFfmpeg, makeProxyAgent, parseRanges, secToTag };

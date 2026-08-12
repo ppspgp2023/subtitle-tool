@@ -6,10 +6,13 @@
   "bin": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "serve": "node server/server.js",
     "build": "node build.js",
     "check": "node scripts/check-api.js"
   },
   "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
     "ffmpeg-static": "^5.2.0"
   },
   "devDependencies": {

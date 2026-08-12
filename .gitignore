@@ -5,3 +5,5 @@ sea-config.json
 test.mp4
 *.srt
 config.txt
+.env
+data/
