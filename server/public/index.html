@@ -54,6 +54,16 @@
         </div>
       </div>
       <p class="hint" id="uploadHint"></p>
+
+      <!-- 磁力导入（仅当服务端配了 TorBox Key 时显示）-->
+      <div class="magnet-block" id="magnetBlock" hidden>
+        <div class="divider"><span>或</span></div>
+        <div class="row">
+          <input type="text" id="magnetInput" class="grow" placeholder="粘贴磁力链接 magnet:?xt=urn:btih:…（由 TorBox 云端下载）" />
+          <button id="magnetBtn">磁力导入并生成字幕</button>
+        </div>
+        <p class="hint" id="magnetHint">磁力任务与上传共用上方的字幕类型/语言/时间段选项。</p>
+      </div>
     </section>
 
     <!-- 实时进度 -->

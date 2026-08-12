@@ -254,12 +254,61 @@ async function deleteFile(f) {
   }
 }
 
+// ---------- 磁力导入 ----------
+async function handleMagnet() {
+  const input = $('magnetInput');
+  const link = input.value.trim();
+  const hint = $('magnetHint');
+  const btn = $('magnetBtn');
+  if (!link) { hint.textContent = '请粘贴磁力链接'; return; }
+
+  btn.disabled = true;
+  hint.textContent = '正在提交磁力…';
+  try {
+    const bilingual = $('subtitleType').value === 'bilingual';
+    const sourceLang = $('sourceLang').value;
+    const ranges = $('ranges').value.trim();
+
+    const res = await fetch('/api/magnet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ magnet: link, bilingual, sourceLang, ranges: ranges || undefined }),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.error || '提交失败');
+    }
+    const { jobId } = await res.json();
+    hint.textContent = '任务已开始，见下方进度（TorBox 云端下载可能需要几分钟）。';
+    input.value = '';
+    watchJob(jobId);
+    loadFiles();
+  } catch (e) {
+    hint.textContent = '出错：' + (e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 探测磁力导入是否可用，只有服务端配了 Key 才显示入口
+async function initConfig() {
+  try {
+    const res = await fetch('/api/config');
+    if (!res.ok) return;
+    const c = await res.json();
+    if (c.magnetEnabled) $('magnetBlock').hidden = false;
+  } catch (_) {}
+}
+
 // ---------- 事件绑定 ----------
 $('uploadBtn').addEventListener('click', handleUpload);
 $('refreshBtn').addEventListener('click', loadFiles);
+const magnetBtnEl = $('magnetBtn');
+if (magnetBtnEl) magnetBtnEl.addEventListener('click', handleMagnet);
 $('logoutBtn').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' }).catch(() => {});
   location.href = '/login.html';
 });
 
+initConfig();
 loadFiles();

@@ -61,4 +61,13 @@ const web = {
   tmpDir,
 };
 
-module.exports = { conf, web };
+// 磁力导入（可选）：仅当配置了 provider 的 API Key 且未被开关关闭时启用。
+// adapter 模式，以后换服务只需改 MAGNET_PROVIDER + 对应 Key。
+const magnet = {
+  provider: opt('MAGNET_PROVIDER', 'torbox'),
+  torboxApiKey: opt('TORBOX_API_KEY', ''),
+  enabled: false,
+};
+magnet.enabled = !!magnet.torboxApiKey && opt('MAGNET_ENABLED', 'true').toLowerCase() !== 'false';
+
+module.exports = { conf, web, magnet };

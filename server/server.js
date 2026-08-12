@@ -9,9 +9,10 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 
-const { web } = require('./config');
+const { web, magnet } = require('./config');
 const { login, logout, requireAuth } = require('./auth');
 const jobsMod = require('./jobs');
+const magnetMod = require('./magnet');
 const { startCleanup, RETENTION_MS } = require('./cleanup');
 const { parseRanges } = require('../src/index.js');
 
@@ -126,6 +127,29 @@ app.get('/api/jobs/:id/events', (req, res) => {
   jobsMod.subscribe(req.params.id, res);
 });
 
+// ---- 前端配置探测：磁力导入是否可用（配了 Key 才显示入口）----
+app.get('/api/config', (req, res) => {
+  res.json({ magnetEnabled: magnet.enabled });
+});
+
+// ---- 磁力导入：提交后立即返回 jobId，后台下载并复用同一条 SSE/流水线 ----
+app.post('/api/magnet', (req, res) => {
+  if (!magnet.enabled) return res.status(400).json({ error: '磁力导入未启用' });
+  const { magnet: link, bilingual, sourceLang, ranges } = req.body || {};
+  if (!link || !magnetMod.isValidMagnet(String(link))) {
+    return res.status(400).json({ error: '磁力链接格式不正确' });
+  }
+  const opts = {};
+  if (typeof bilingual === 'boolean') opts.bilingual = bilingual;
+  if (sourceLang) opts.sourceLang = sourceLang;
+  if (ranges) {
+    const parsed = parseRanges(String(ranges));
+    if (parsed) opts.ranges = parsed;
+  }
+  const jobId = jobsMod.enqueueMagnet(String(link).trim(), opts);
+  res.json({ jobId });
+});
+
 // ---- 文件列表 / 删除 / 下载 ----
 app.get('/api/files', (req, res) => {
   let list;
@@ -177,7 +201,11 @@ app.use(express.static(PUBLIC));
 app.get('/', (req, res) => res.sendFile(path.join(PUBLIC, 'index.html')));
 
 startCleanup();
+if (magnet.enabled) {
+  magnetMod.cleanupOrphans().catch(() => {});
+}
 app.listen(web.port, () => {
   console.log(`\n视频字幕生成服务已启动： http://localhost:${web.port}`);
-  console.log(`数据目录：${web.dataDir}（保留 ${web.retentionDays} 天）\n`);
+  console.log(`数据目录：${web.dataDir}（保留 ${web.retentionDays} 天）`);
+  console.log(`磁力导入：${magnet.enabled ? '已启用（' + magnet.provider + '）' : '未启用'}\n`);
 });

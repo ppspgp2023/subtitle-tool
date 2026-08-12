@@ -157,3 +157,21 @@ button.ghost:hover { color: var(--text); background: rgba(255,255,255,0.05); }
 }
 .link:hover { text-decoration: underline; background: none; }
 .link.danger { color: var(--danger); }
+
+/* 磁力导入 */
+.grow { flex: 1; min-width: 260px; }
+.magnet-block { margin-top: 8px; }
+.divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  margin: 14px 0 4px;
+}
+.divider::before, .divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+.divider span { padding: 0 12px; }

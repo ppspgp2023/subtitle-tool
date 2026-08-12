@@ -53,6 +53,30 @@ function enqueue(fileId, videoPath, baseName, options = {}) {
   return id;
 }
 
+// 创建“磁力导入”任务：预生成 fileId，视频尚未落地，先入队，处理时先下载再走流水线。
+function enqueueMagnet(magnet, options = {}) {
+  const id = newId();
+  const fileId = crypto.randomBytes(8).toString('hex');
+  const job = {
+    id,
+    fileId,
+    videoPath: null,
+    baseName: null,
+    options,
+    magnet,
+    status: 'queued',
+    log: [],
+    error: null,
+    srtPath: null,
+    createdAt: Date.now(),
+  };
+  jobs.set(id, job);
+  jobByFile.set(fileId, id);
+  queue.push(id);
+  process.nextTick(processNext);
+  return id;
+}
+
 async function processNext() {
   if (running) return;
   const id = queue.shift();
@@ -70,6 +94,17 @@ async function processNext() {
   };
 
   try {
+    // 磁力导入任务：先把视频从 TorBox 拉回本地，落地成 uploads/<fileId>__<原名>
+    if (job.magnet && !job.videoPath) {
+      const { downloadMagnet } = require('./magnet');
+      const { videoPath, name } = await downloadMagnet(job.magnet, {
+        fileId: job.fileId,
+        onProgress,
+      });
+      job.videoPath = videoPath;
+      job.baseName = name.replace(/\.[^.]+$/, '');
+    }
+
     // 每个任务基于全局 conf 派生，允许覆盖 双语/原语言
     const jobConf = Object.assign({}, conf);
     if (typeof job.options.bilingual === 'boolean') jobConf.bilingual = job.options.bilingual;
@@ -149,4 +184,4 @@ function dropByFile(fileId) {
   }
 }
 
-module.exports = { enqueue, getJob, getJobByFile, subscribe, dropByFile };
+module.exports = { enqueue, enqueueMagnet, getJob, getJobByFile, subscribe, dropByFile };
